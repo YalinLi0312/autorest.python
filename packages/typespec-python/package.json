@@ -59,7 +59,8 @@
     "js-yaml": "~4.1.0",
     "@typespec/openapi3": "~0.59.0",
     "semver": "~7.6.2",
-    "tsx": "4.17.0"
+    "tsx": "4.17.0",
+    "pyodide": "0.26.2"
   },
   "devDependencies": {
     "@azure-tools/typespec-azure-resource-manager": "~0.45.0",

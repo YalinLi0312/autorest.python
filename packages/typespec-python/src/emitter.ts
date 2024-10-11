@@ -1,18 +1,20 @@
-import { EmitContext } from "@typespec/compiler";
 import {
     createSdkContext,
     SdkContext,
     SdkHttpOperation,
     SdkServiceOperation,
 } from "@azure-tools/typespec-client-generator-core";
-import { saveCodeModelAsYaml } from "./external-process.js";
-import { dirname } from "path";
+import { EmitContext } from "@typespec/compiler";
+import { execSync } from "child_process";
+import fs from "fs";
+import path, { dirname } from "path";
 import { fileURLToPath } from "url";
-import { execFileSync } from "child_process";
-import { PythonEmitterOptions, PythonSdkContext } from "./lib.js";
 import { emitCodeModel } from "./code-model.js";
+import { saveCodeModelAsYaml } from "./external-process.js";
+import { PythonEmitterOptions, PythonSdkContext } from "./lib.js";
 import { removeUnderscoresFromNamespace } from "./utils.js";
-import path from "path";
+import { loadPyodide } from "pyodide";
+import jsyaml from "js-yaml";
 
 export function getModelsMode(context: SdkContext): "dpg" | "none" {
     const specifiedModelsMode = context.emitContext.options["models-mode"];
@@ -71,39 +73,124 @@ export async function $onEmit(context: EmitContext<PythonEmitterOptions>) {
     const outputDir = context.emitterOutputDir;
     const yamlMap = emitCodeModel(sdkContext);
     addDefaultOptions(sdkContext);
-    const yamlPath = await saveCodeModelAsYaml("typespec-python-yaml-map", yamlMap);
-    const commandArgs = [
-        `${root}/dist/scripts/run-python3.js`,
-        `${root}/scripts/run_tsp.py`,
-        `--output-folder=${outputDir}`,
-        `--cadl-file=${yamlPath}`,
-    ];
-    const resolvedOptions = sdkContext.emitContext.options;
-    if (resolvedOptions["packaging-files-config"]) {
-        const keyValuePairs = Object.entries(resolvedOptions["packaging-files-config"]).map(([key, value]) => {
-            return `${key}:${value}`;
-        });
-        commandArgs.push(`--packaging-files-config='${keyValuePairs.join("|")}'`);
-        resolvedOptions["packaging-files-config"] = undefined;
-    }
-    if (
-        resolvedOptions["package-pprint-name"] !== undefined &&
-        !resolvedOptions["package-pprint-name"].startsWith('"')
-    ) {
-        resolvedOptions["package-pprint-name"] = `"${resolvedOptions["package-pprint-name"]}"`;
-    }
 
-    for (const [key, value] of Object.entries(resolvedOptions)) {
-        commandArgs.push(`--${key}=${value}`);
-    }
-    if (sdkContext.arm === true) {
-        commandArgs.push("--azure-arm=true");
-    }
-    if (resolvedOptions.flavor === "azure") {
-        commandArgs.push("--emit-cross-language-definition-file=true");
-    }
-    commandArgs.push("--from-typespec=true");
-    if (!program.compilerOptions.noEmit && !program.hasError()) {
-        execFileSync(process.execPath, commandArgs);
+    const resolvedOptions = sdkContext.emitContext.options;
+    if (resolvedOptions["use-pyodide"]) {
+        const commandArgs: Record<string, string> = {}
+        if (resolvedOptions["packaging-files-config"]) {
+            const keyValuePairs = Object.entries(resolvedOptions["packaging-files-config"]).map(([key, value]) => {
+                return `${key}:${value}`;
+            });
+            commandArgs["packaging-files-config"] = keyValuePairs.join("|");
+            resolvedOptions["packaging-files-config"] = undefined;
+        }
+        if (
+            resolvedOptions["package-pprint-name"] !== undefined &&
+            !resolvedOptions["package-pprint-name"].startsWith('"')
+        ) {
+            resolvedOptions["package-pprint-name"] = `"${resolvedOptions["package-pprint-name"]}"`;
+        }
+    
+        for (const [key, value] of Object.entries(resolvedOptions)) {
+            commandArgs[key] = value;
+        }
+        if (sdkContext.arm === true) {
+            commandArgs["azure-arm"]="true";
+        }
+        if (resolvedOptions.flavor === "azure") {
+            commandArgs["emit-cross-language-definition-file"]="true";
+        }
+        commandArgs["from-typespec"] = "true";
+
+        if (!program.compilerOptions.noEmit && !program.hasError()) {
+            const outputFolder = path.relative(root, outputDir)
+            let pyodide = await loadPyodide({indexURL: path.join(root, "node_modules", "pyodide")});
+            pyodide.FS.mount(pyodide.FS.filesystems.NODEFS, { root: "." }, ".");
+            const yamlStr = jsyaml.dump(yamlMap);
+            if (!fs.existsSync("/temp")) {
+                pyodide.FS.mkdirTree("/temp");
+            }
+            const yamlPath = "./temp/yamldata.yaml"
+            pyodide.FS.writeFile(yamlPath, yamlStr);
+            
+            let start = Date.now();
+            console.log(`The start timestamp of installing deps is ${start}.`);
+            await pyodide.loadPackage("micropip");
+            const micropip = pyodide.pyimport("micropip");
+            await micropip.install(
+                [
+                    "black",
+                    "click",
+                    "docutils",
+                    "Jinja2",
+                    "m2r2",
+                    "MarkupSafe",
+                    "pathspec",
+                    "platformdirs",
+                    "PyYAML",
+                    "tomli",
+                    "setuptools",
+                ]
+            );
+            await micropip.install("https://github.com/YalinLi0312/autorest.python/releases/download/v5.0.0/pygen-0.1.0-py3-none-any.whl");
+            let end = Date.now();
+            console.log(`The end timestamp of installing deps is ${end}.`);
+            console.log(end - start);
+            const globals = pyodide.toPy({outputFolder, yamlPath, commandArgs});
+            const python = `
+            async def main():
+                from pygen import m2r, preprocess, codegen, black
+    
+                m2r.M2R(output_folder=outputFolder, cadl_file=yamlPath, **commandArgs).process()
+                preprocess.PreProcessPlugin(output_folder=outputFolder, cadl_file=yamlPath, **commandArgs).process()
+                codegen.CodeGenerator(output_folder=outputFolder, cadl_file=yamlPath, **commandArgs).process()
+                black.BlackScriptPlugin(output_folder=outputFolder, **commandArgs).process()
+        
+            await main()
+            `
+            start = Date.now();
+            console.log(`The start timestamp of generating package is ${start}.`);
+            await pyodide.runPythonAsync(python, {globals});
+            end = Date.now();
+            console.log(`The end timestamp of generating package is ${end}.`);
+            console.log(end - start);
+        }
+    } else {
+        const yamlPath = await saveCodeModelAsYaml("python-yaml-path", yamlMap);
+        const commandArgs = [
+            `${root}/dist/scripts/run-python3.js`,
+            `${root}/eng/scripts/setup/run_tsp.py`,
+            `--output-folder=${outputDir}`,
+            `--cadl-file=${yamlPath}`,
+        ];
+        if (resolvedOptions["packaging-files-config"]) {
+            const keyValuePairs = Object.entries(resolvedOptions["packaging-files-config"]).map(
+              ([key, value]) => {
+                return `${key}:${value}`;
+              },
+            );
+            commandArgs.push(`--packaging-files-config='${keyValuePairs.join("|")}'`);
+            resolvedOptions["packaging-files-config"] = undefined;
+          }
+          if (
+            resolvedOptions["package-pprint-name"] !== undefined &&
+            !resolvedOptions["package-pprint-name"].startsWith('"')
+          ) {
+            resolvedOptions["package-pprint-name"] = `"${resolvedOptions["package-pprint-name"]}"`;
+          }
+        
+          for (const [key, value] of Object.entries(resolvedOptions)) {
+            commandArgs.push(`--${key}=${value}`);
+          }
+          if (sdkContext.arm === true) {
+            commandArgs.push("--azure-arm=true");
+          }
+          if (resolvedOptions.flavor === "azure") {
+            commandArgs.push("--emit-cross-language-definition-file=true");
+          }
+          commandArgs.push("--from-typespec=true");
+          if (!program.compilerOptions.noEmit && !program.hasError()) {
+            execSync(commandArgs.join(" "));
+          }
     }
 }

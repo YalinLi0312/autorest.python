@@ -132,12 +132,14 @@ interface RegenerateFlagsInput {
     flavor?: "azure" | "unbranded";
     debug?: boolean;
     name?: string;
+    pyodide?: boolean;
 }
 
 interface RegenerateFlags {
     flavor: "azure" | "unbranded";
     debug: boolean;
     name?: string;
+    pyodide?: boolean;
 }
 
 const SpecialFlags: Record<string, Record<string, any>> = {
@@ -210,6 +212,9 @@ function addOptions(spec: string, generatedFolder: string, flags: RegenerateFlag
     const emitterConfigs: string[] = [];
     for (const config of getEmitterOption(spec)) {
         const options: Record<string, string> = { ...config };
+        if (flags.pyodide) {
+            options["use-pyodide"] = "true";
+        }
         options["flavor"] = flags.flavor;
         for (const [k, v] of Object.entries(SpecialFlags[flags.flavor] ?? {})) {
             options[k] = v;
@@ -278,6 +283,11 @@ const argv = yargs(hideBin(process.argv))
         alias: "n",
         type: "string",
         description: "Specify filename if you only want to generate a subset",
+    })
+    .option("pyodide", {
+        alias: "p",
+        type: "boolean",
+        description: "Run python in Pyodide",
     }).argv;
 
 regenerate(argv as RegenerateFlags)
